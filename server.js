@@ -5,31 +5,44 @@ const io = require("socket.io")(http, { cors: { origin: "*" } });
 
 app.use(express.json());
 
-// --- THIS IS THE NEW "MAILBOX" FOR PYTHON ---
+let currentTask = null; // Stores the command from your phone
+
+// --- 1. PHONE COMMAND PORTAL ---
+// Your phone hits this to tell the Army what to do
+app.post("/phone_to_army", (req, res) => {
+    const { prompt } = req.body;
+    currentTask = { prompt, status: "pending", timestamp: Date.now() };
+    console.log("New Mission Received from Phone:", prompt);
+    res.status(200).json({ message: "Mission sent to the Army." });
+});
+
+// --- 2. LAPTOP POLLING PORTAL ---
+// The laptop hits this to check for new missions
+app.get("/get_mission", (req, res) => {
+    if (currentTask && currentTask.status === "pending") {
+        res.json(currentTask);
+        currentTask.status = "executing"; // Mark as busy
+    } else {
+        res.status(204).send(); // No new tasks
+    }
+});
+
+// --- 3. ARMY STATUS RELAY ---
+// The laptop hits this to tell your phone it's done or stuck
 app.post("/laptop_to_phone", (req, res) => {
     const data = req.body;
-    console.log("Received from Python Army:", data.message);
-
-    // Broadcast to the registered 'phone' socket
-    io.to("phone").emit("notification", data);
-
-    res.status(200).send("Relayed to phone successfully");
+    console.log("Relaying Report to Phone:", data.message);
+    io.to("phone").emit("notification", data); // Shouts to your phone app
+    res.status(200).send("Report relayed.");
 });
 
-// --- THE REST OF YOUR SOCKET LOGIC ---
+// --- 4. SOCKET CONNECTIONS ---
 io.on("connection", (socket) => {
-    console.log("Device connected:", socket.id);
-
     socket.on("register", (deviceType) => {
         socket.join(deviceType);
-        console.log(`${deviceType} registered.`);
+        console.log(`${deviceType} registered for updates.`);
     });
-
-    socket.on("disconnect", () => console.log("Device disconnected"));
 });
 
-// Start the server on port 3000 (Render will usually provide a port)
 const PORT = process.env.PORT || 3000;
-http.listen(PORT, () => {
-    console.log(`Mercury Relay running on port ${PORT}...`);
-});
+http.listen(PORT, () => console.log(`Mercury Command Center live on port ${PORT}`));
