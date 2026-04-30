@@ -5,43 +5,49 @@ const io = require("socket.io")(http, { cors: { origin: "*" } });
 
 app.use(express.json());
 
-let currentTask = null; // Stores the command from your phone
+let currentTask = null;
 
-// --- 1. PHONE COMMAND PORTAL ---
-// Your phone hits this to tell the Army what to do
-app.post("/phone_to_army", (req, res) => {
-    const { prompt } = req.body;
-    currentTask = { prompt, status: "pending", timestamp: Date.now() };
-    console.log("New Mission Received from Phone:", prompt);
-    res.status(200).json({ message: "Mission sent to the Army." });
+// --- ADD THIS: Root route to stop the "Cannot GET /" error ---
+app.get("/", (req, res) => {
+    res.send("📡 Mercury Command Center is Live.");
 });
 
-// --- 2. LAPTOP POLLING PORTAL ---
-// The laptop hits this to check for new missions
-app.get("/get_mission", (req, res) => {
-    if (currentTask && currentTask.status === "pending") {
-        res.json(currentTask);
-        currentTask.status = "executing"; // Mark as busy
-    } else {
-        res.status(204).send(); // No new tasks
-    }
-});
-
-// --- 3. ARMY STATUS RELAY ---
-// The laptop hits this to tell your phone it's done or stuck
-app.post("/laptop_to_phone", (req, res) => {
-    const data = req.body;
-    console.log("Relaying Report to Phone:", data.message);
-    io.to("phone").emit("notification", data); // Shouts to your phone app
-    res.status(200).send("Report relayed.");
-});
-
-// --- 4. SOCKET CONNECTIONS ---
+// --- 1. THE BRIDGE: SOCKET -> TASK VARIABLE ---
 io.on("connection", (socket) => {
     socket.on("register", (deviceType) => {
         socket.join(deviceType);
-        console.log(`${deviceType} registered for updates.`);
+        console.log(`${deviceType} registered.`);
     });
+
+    // THIS IS WHAT WAS MISSING:
+    // When the phone emits via Socket, we save it to currentTask
+    socket.on("phone_to_army", (data) => {
+        console.log("Mission received via Socket:", data.prompt);
+        currentTask = {
+            prompt: data.prompt,
+            status: "pending",
+            timestamp: Date.now()
+        };
+    });
+});
+
+// --- 2. LAPTOP POLLING PORTAL (Keep this as is) ---
+app.get("/get_mission", (req, res) => {
+    if (currentTask && currentTask.status === "pending") {
+        console.log("Serving mission to Laptop:", currentTask.prompt);
+        res.json(currentTask);
+        currentTask.status = "executing";
+    } else {
+        res.status(204).send();
+    }
+});
+
+// --- 3. ARMY STATUS RELAY (Keep this as is) ---
+app.post("/laptop_to_phone", (req, res) => {
+    const data = req.body;
+    console.log("Relaying Report to Phone:", data.message);
+    io.to("phone").emit("notification", data);
+    res.status(200).send("Report relayed.");
 });
 
 const PORT = process.env.PORT || 3000;
