@@ -1,6 +1,5 @@
 /**
- * Cipher relay — phone <-> laptop
- * get_mission claims are atomic so one mission is never delivered twice.
+ * Cipher relay — single-flight missions (no double deliver).
  */
 const express = require("express");
 const app = express();
@@ -16,16 +15,51 @@ function auth(req, res, next) {
   return res.status(401).send("unauthorized");
 }
 
+/** @type {{ prompt: string, status: string, timestamp: number } | null} */
 let currentTask = null;
+const missionQueue = [];
 let currentDecision = null;
 let openApprovalId = null;
 let seq = 1;
 const inbox = [];
 const INBOX_MAX = 80;
-let missionLock = false;
 
 function newId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+function enqueueMission(prompt) {
+  const p = String(prompt || "").trim();
+  if (!p) return;
+  // Drop exact duplicate of what's running or already queued
+  if (currentTask && currentTask.prompt === p) {
+    console.log("skip dup mission (active):", p.slice(0, 80));
+    return;
+  }
+  if (missionQueue.some((t) => t.prompt === p)) {
+    console.log("skip dup mission (queued):", p.slice(0, 80));
+    return;
+  }
+  const task = { prompt: p, status: "pending", timestamp: Date.now() };
+  if (!currentTask || currentTask.status === "done") {
+    currentTask = task;
+    console.log("mission active:", p.slice(0, 120));
+    io.to("laptop").emit("mission", currentTask);
+  } else {
+    missionQueue.push(task);
+    console.log("mission queued behind active:", p.slice(0, 80), "depth=", missionQueue.length);
+  }
+}
+
+function promoteNext() {
+  if (missionQueue.length === 0) {
+    currentTask = null;
+    return;
+  }
+  currentTask = missionQueue.shift();
+  currentTask.status = "pending";
+  console.log("promote mission:", currentTask.prompt.slice(0, 120));
+  io.to("laptop").emit("mission", currentTask);
 }
 
 app.get("/", (_req, res) => res.send("Cipher relay live."));
@@ -36,17 +70,15 @@ io.on("connection", (socket) => {
     socket.join(room);
     console.log(room, "registered", socket.id);
     if (room === "phone") {
-      const recent = inbox.filter((m) => m.kind !== "approve" && m.kind !== "answer").slice(-30);
+      const recent = inbox
+        .filter((m) => m.kind !== "approve" && m.kind !== "answer")
+        .slice(-30);
       if (recent.length) socket.emit("inbox", { messages: recent });
     }
   });
 
   socket.on("phone_to_army", (data) => {
-    const prompt = (data && data.prompt) || "";
-    console.log("mission:", String(prompt).slice(0, 200));
-    currentTask = { prompt: String(prompt), status: "pending", timestamp: Date.now() };
-    missionLock = false;
-    io.to("laptop").emit("mission", currentTask);
+    enqueueMission((data && data.prompt) || "");
   });
 
   socket.on("phone_to_laptop", (data) => {
@@ -64,14 +96,25 @@ io.on("connection", (socket) => {
 });
 
 app.get("/get_mission", auth, (req, res) => {
-  // Atomic claim — concurrent polls must not both receive the same mission
-  if (missionLock || !currentTask || currentTask.status !== "pending") {
+  if (!currentTask || currentTask.status !== "pending") {
     return res.status(204).send();
   }
-  missionLock = true;
+  // Claim exactly once
   currentTask.status = "executing";
-  const out = { ...currentTask };
-  return res.json(out);
+  return res.json({
+    prompt: currentTask.prompt,
+    status: currentTask.status,
+    timestamp: currentTask.timestamp,
+  });
+});
+
+/** Laptop finished a mission — allow next queued item */
+app.post("/mission_done", auth, (req, res) => {
+  if (currentTask) {
+    currentTask.status = "done";
+  }
+  promoteNext();
+  res.status(200).json({ ok: true, pending: missionQueue.length });
 });
 
 app.post("/clear_decision", auth, (_req, res) => {
