@@ -1,6 +1,6 @@
 /**
  * Cipher relay — phone <-> laptop
- * Decisions are id-scoped so a stale "No" cannot apply to a later ship prompt.
+ * get_mission claims are atomic so one mission is never delivered twice.
  */
 const express = require("express");
 const app = express();
@@ -17,13 +17,12 @@ function auth(req, res, next) {
 }
 
 let currentTask = null;
-/** @type {{ id: string, command: string, status: string, timestamp: number } | null} */
 let currentDecision = null;
-/** Active approval the laptop is waiting on (set by POST /begin_approval) */
 let openApprovalId = null;
-
+let seq = 1;
 const inbox = [];
-const INBOX_MAX = 40;
+const INBOX_MAX = 80;
+let missionLock = false;
 
 function newId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
@@ -36,8 +35,9 @@ io.on("connection", (socket) => {
     const room = String(deviceType || "unknown");
     socket.join(room);
     console.log(room, "registered", socket.id);
-    if (room === "phone" && inbox.length) {
-      socket.emit("inbox", { messages: inbox.slice(-20) });
+    if (room === "phone") {
+      const recent = inbox.filter((m) => m.kind !== "approve" && m.kind !== "answer").slice(-30);
+      if (recent.length) socket.emit("inbox", { messages: recent });
     }
   });
 
@@ -45,12 +45,12 @@ io.on("connection", (socket) => {
     const prompt = (data && data.prompt) || "";
     console.log("mission:", String(prompt).slice(0, 200));
     currentTask = { prompt: String(prompt), status: "pending", timestamp: Date.now() };
+    missionLock = false;
     io.to("laptop").emit("mission", currentTask);
   });
 
   socket.on("phone_to_laptop", (data) => {
     const command = (data && (data.command || data.message)) || "";
-    // Bind decision to the open approval id if any
     const id = (data && data.id) || openApprovalId || newId();
     console.log("decision:", command, "id=", id);
     currentDecision = {
@@ -64,29 +64,26 @@ io.on("connection", (socket) => {
 });
 
 app.get("/get_mission", auth, (req, res) => {
-  if (currentTask && currentTask.status === "pending") {
-    currentTask.status = "executing";
-    return res.json(currentTask);
+  // Atomic claim — concurrent polls must not both receive the same mission
+  if (missionLock || !currentTask || currentTask.status !== "pending") {
+    return res.status(204).send();
   }
-  return res.status(204).send();
+  missionLock = true;
+  currentTask.status = "executing";
+  const out = { ...currentTask };
+  return res.json(out);
 });
 
-/** Drop any stale yes/no before a new approval wait. */
 app.post("/clear_decision", auth, (_req, res) => {
   currentDecision = null;
   openApprovalId = null;
   res.status(200).json({ ok: true });
 });
 
-/**
- * Laptop starts an approval; returns id. Phone Yes/No should include same id.
- * Clears previous pending decision so old No cannot leak.
- */
 app.post("/begin_approval", auth, (req, res) => {
   const id = (req.body && req.body.id) || newId();
   currentDecision = null;
   openApprovalId = String(id);
-  console.log("begin_approval", openApprovalId);
   res.status(200).json({ id: openApprovalId });
 });
 
@@ -95,12 +92,7 @@ app.get("/get_decision", auth, (req, res) => {
   if (!currentDecision || currentDecision.status !== "pending") {
     return res.status(204).send();
   }
-  // If laptop asked for a specific id, only return matching decision
   if (wantId && currentDecision.id && currentDecision.id !== wantId) {
-    return res.status(204).send();
-  }
-  // If openApprovalId is set and decision has no id match, still require match when wantId set
-  if (openApprovalId && wantId && currentDecision.id !== wantId) {
     return res.status(204).send();
   }
   currentDecision.status = "consumed";
@@ -115,7 +107,7 @@ app.post("/laptop_to_phone", auth, (req, res) => {
   const message = String(data.message || "");
   const kind = String(data.kind || "status");
   const id = data.id ? String(data.id) : undefined;
-  const payload = { message, kind, timestamp: Date.now() };
+  const payload = { message, kind, timestamp: Date.now(), seq: seq++ };
   if (id) payload.id = id;
   inbox.push(payload);
   while (inbox.length > INBOX_MAX) inbox.shift();
@@ -124,8 +116,12 @@ app.post("/laptop_to_phone", auth, (req, res) => {
   res.status(200).send("ok");
 });
 
-app.get("/phone_inbox", auth, (_req, res) => {
-  res.json({ messages: inbox.slice(-20) });
+app.get("/phone_inbox", auth, (req, res) => {
+  const since = parseInt(req.query.since || "0", 10) || 0;
+  const messages = inbox.filter(
+    (m) => (m.seq || 0) > since && m.kind !== "approve" && m.kind !== "answer"
+  );
+  res.json({ messages, latest: seq - 1 });
 });
 
 const PORT = process.env.PORT || 3000;
