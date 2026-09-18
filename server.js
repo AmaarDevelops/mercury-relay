@@ -1,5 +1,5 @@
 /**
- * Cipher relay — single-flight missions (no double deliver).
+ * Cipher relay — single-flight missions, recovery if executing gets stuck.
  */
 const express = require("express");
 const app = express();
@@ -23,17 +23,32 @@ let openApprovalId = null;
 let seq = 1;
 const inbox = [];
 const INBOX_MAX = 80;
+const EXEC_STALE_MS = 3 * 60 * 1000; // reclaim if laptop died mid-mission
 
 function newId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
 
+function reclaimIfStale() {
+  if (!currentTask) return;
+  if (currentTask.status !== "executing") return;
+  const age = Date.now() - (currentTask.timestamp || 0);
+  if (age < EXEC_STALE_MS) return;
+  console.log("reclaim stale executing mission:", (currentTask.prompt || "").slice(0, 80));
+  currentTask.status = "done";
+  promoteNext();
+}
+
 function enqueueMission(prompt) {
   const p = String(prompt || "").trim();
   if (!p) return;
-  // Drop exact duplicate of what's running or already queued
-  if (currentTask && currentTask.prompt === p) {
+  reclaimIfStale();
+  if (currentTask && currentTask.prompt === p && currentTask.status !== "done") {
     console.log("skip dup mission (active):", p.slice(0, 80));
+    // Re-emit so a reconnecting laptop still sees it
+    if (currentTask.status === "pending") {
+      io.to("laptop").emit("mission", currentTask);
+    }
     return;
   }
   if (missionQueue.some((t) => t.prompt === p)) {
@@ -45,9 +60,17 @@ function enqueueMission(prompt) {
     currentTask = task;
     console.log("mission active:", p.slice(0, 120));
     io.to("laptop").emit("mission", currentTask);
+  } else if (currentTask.status === "pending") {
+    // Replace unused pending with newest (user re-spoke)
+    console.log("replace pending mission with newer");
+    currentTask = task;
+    io.to("laptop").emit("mission", currentTask);
   } else {
+    // executing — queue behind
     missionQueue.push(task);
     console.log("mission queued behind active:", p.slice(0, 80), "depth=", missionQueue.length);
+    // Nudge laptop in case it missed the active one
+    io.to("laptop").emit("mission", currentTask);
   }
 }
 
@@ -58,6 +81,7 @@ function promoteNext() {
   }
   currentTask = missionQueue.shift();
   currentTask.status = "pending";
+  currentTask.timestamp = Date.now();
   console.log("promote mission:", currentTask.prompt.slice(0, 120));
   io.to("laptop").emit("mission", currentTask);
 }
@@ -75,10 +99,19 @@ io.on("connection", (socket) => {
         .slice(-30);
       if (recent.length) socket.emit("inbox", { messages: recent });
     }
+    if (room === "laptop") {
+      reclaimIfStale();
+      // Replay pending mission so push-mode laptop starts immediately
+      if (currentTask && currentTask.status === "pending") {
+        socket.emit("mission", currentTask);
+      }
+    }
   });
 
   socket.on("phone_to_army", (data) => {
-    enqueueMission((data && data.prompt) || "");
+    const prompt = (data && (data.prompt || data.message)) || "";
+    console.log("phone_to_army:", String(prompt).slice(0, 120));
+    enqueueMission(prompt);
   });
 
   socket.on("phone_to_laptop", (data) => {
@@ -95,12 +128,22 @@ io.on("connection", (socket) => {
   });
 });
 
+/** HTTP path so phone can send even if socket is flaky */
+app.post("/phone_mission", auth, (req, res) => {
+  const prompt = String((req.body && (req.body.prompt || req.body.message)) || "").trim();
+  console.log("POST /phone_mission:", prompt.slice(0, 120));
+  if (!prompt) return res.status(400).json({ ok: false, error: "empty" });
+  enqueueMission(prompt);
+  res.status(200).json({ ok: true, queued: missionQueue.length, active: !!(currentTask && currentTask.status !== "done") });
+});
+
 app.get("/get_mission", auth, (req, res) => {
+  reclaimIfStale();
   if (!currentTask || currentTask.status !== "pending") {
     return res.status(204).send();
   }
-  // Claim exactly once
   currentTask.status = "executing";
+  currentTask.timestamp = Date.now();
   return res.json({
     prompt: currentTask.prompt,
     status: currentTask.status,
@@ -108,13 +151,20 @@ app.get("/get_mission", auth, (req, res) => {
   });
 });
 
-/** Laptop finished a mission — allow next queued item */
 app.post("/mission_done", auth, (req, res) => {
   if (currentTask) {
     currentTask.status = "done";
   }
   promoteNext();
   res.status(200).json({ ok: true, pending: missionQueue.length });
+});
+
+/** Force-clear stuck mission (laptop can call on start) */
+app.post("/mission_reset", auth, (_req, res) => {
+  currentTask = null;
+  missionQueue.length = 0;
+  console.log("mission_reset");
+  res.status(200).json({ ok: true });
 });
 
 app.post("/clear_decision", auth, (_req, res) => {
@@ -160,11 +210,19 @@ app.post("/laptop_to_phone", auth, (req, res) => {
 });
 
 app.get("/phone_inbox", auth, (req, res) => {
-  const since = parseInt(req.query.since || "0", 10) || 0;
-  const messages = inbox.filter(
-    (m) => (m.seq || 0) > since && m.kind !== "approve" && m.kind !== "answer"
-  );
+  const after = parseInt(String(req.query.after || "0"), 10) || 0;
+  const messages = inbox.filter((m) => (m.seq || 0) > after);
   res.json({ messages, latest: seq - 1 });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    task: currentTask
+      ? { status: currentTask.status, prompt: (currentTask.prompt || "").slice(0, 80) }
+      : null,
+    queue: missionQueue.length,
+  });
 });
 
 const PORT = process.env.PORT || 3000;
