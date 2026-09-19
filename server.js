@@ -6,7 +6,7 @@ const app = express();
 const http = require("http").createServer(app);
 const io = require("socket.io")(http, { cors: { origin: "*" } });
 
-app.use(express.json());
+app.use(express.json({ limit: "8mb" }));
 
 const TOKEN = (process.env.CIPHER_BRIDGE_TOKEN || "").trim();
 function auth(req, res, next) {
