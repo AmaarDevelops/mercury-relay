@@ -23,6 +23,10 @@ let openApprovalId = null;
 let seq = 1;
 const inbox = [];
 const INBOX_MAX = 80;
+/** @type {{ id: string, audioBase64: string, format: string, workspace: string, timestamp: number }[]} */
+const audioQueue = [];
+const AUDIO_MAX = 8;
+
 const EXEC_STALE_MS = 3 * 60 * 1000; // reclaim if laptop died mid-mission
 
 function newId() {
@@ -202,9 +206,16 @@ app.post("/laptop_to_phone", auth, (req, res) => {
   const id = data.id ? String(data.id) : undefined;
   const payload = { message, kind, timestamp: Date.now(), seq: seq++ };
   if (id) payload.id = id;
-  inbox.push(payload);
+  // Optional Groq TTS audio (base64) — do not store huge blobs in inbox history
+  if (data.audioBase64 && typeof data.audioBase64 === "string" && data.audioBase64.length < 3_500_000) {
+    payload.audioBase64 = data.audioBase64;
+    payload.audioFormat = String(data.audioFormat || "mp3");
+  }
+  const forInbox = { ...payload };
+  delete forInbox.audioBase64; // keep inbox light
+  inbox.push(forInbox);
   while (inbox.length > INBOX_MAX) inbox.shift();
-  console.log("to phone", kind, message.slice(0, 120));
+  console.log("to phone", kind, message.slice(0, 120), payload.audioBase64 ? "audio=yes" : "audio=no");
   io.to("phone").emit("notification", payload);
   res.status(200).send("ok");
 });
@@ -213,6 +224,41 @@ app.get("/phone_inbox", auth, (req, res) => {
   const after = parseInt(String(req.query.after || "0"), 10) || 0;
   const messages = inbox.filter((m) => (m.seq || 0) > after);
   res.json({ messages, latest: seq - 1 });
+});
+
+
+/** Phone uploads short voice clip (base64) for Groq Whisper on the laptop */
+app.post("/phone_audio", auth, (req, res) => {
+  const body = req.body || {};
+  const audioBase64 = String(body.audioBase64 || body.audio || "").trim();
+  const format = String(body.format || "m4a").replace(/[^a-z0-9]/gi, "") || "m4a";
+  const workspace = String(body.workspace || "").trim();
+  if (!audioBase64 || audioBase64.length < 100) {
+    return res.status(400).json({ ok: false, error: "empty audio" });
+  }
+  // ~3MB base64 limit for demo clips
+  if (audioBase64.length > 4_000_000) {
+    return res.status(413).json({ ok: false, error: "audio too large" });
+  }
+  const id = newId();
+  audioQueue.push({
+    id,
+    audioBase64,
+    format,
+    workspace,
+    timestamp: Date.now(),
+  });
+  while (audioQueue.length > AUDIO_MAX) audioQueue.shift();
+  console.log("phone_audio queued", id, "fmt=", format, "len=", audioBase64.length, "ws=", workspace.slice(0, 60));
+  io.to("laptop").emit("audio_mission", { id, format, workspace });
+  res.status(200).json({ ok: true, id });
+});
+
+/** Laptop claims next audio clip for Groq STT */
+app.get("/get_audio", auth, (req, res) => {
+  if (audioQueue.length === 0) return res.status(204).send();
+  const item = audioQueue.shift();
+  return res.json(item);
 });
 
 app.get("/health", (_req, res) => {
